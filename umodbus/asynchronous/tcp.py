@@ -130,6 +130,7 @@ class AsyncTCP(CommonTCPFunctions, CommonAsyncModbusFunctions):
             self._sock_writer.close()
             await self._sock_writer.wait_closed()
 
+        self.is_connected = False
         self._sock_reader, self._sock_writer = \
             await asyncio.open_connection(self._slave_ip, self._slave_port)
         self.is_connected = True
