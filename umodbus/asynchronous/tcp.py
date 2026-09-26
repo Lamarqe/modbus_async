@@ -9,6 +9,7 @@
 #
 
 # system packages
+import errno
 import struct
 import socket
 try:
@@ -93,6 +94,9 @@ class AsyncTCP(CommonTCPFunctions, CommonAsyncModbusFunctions):
 
         self._sock_reader: Optional[asyncio.StreamReader] = None
         self._sock_writer: Optional[asyncio.StreamWriter] = None
+        # serializes request/response exchanges on the shared connection,
+        # otherwise concurrent callers could read each other's responses
+        self._lock = asyncio.Lock()
         self.protocol = self
 
     async def _send_receive(self,
@@ -101,39 +105,65 @@ class AsyncTCP(CommonTCPFunctions, CommonAsyncModbusFunctions):
                             count: bool) -> bytes:
         """@see TCP._send_receive"""
 
-        mbap_hdr, trans_id = self._create_mbap_hdr(slave_addr=slave_addr,
-                                                   modbus_pdu=modbus_pdu)
+        async with self._lock:
+            mbap_hdr, trans_id = self._create_mbap_hdr(slave_addr=slave_addr,
+                                                       modbus_pdu=modbus_pdu)
 
-        if self._sock_writer is None or self._sock_reader is None:
-            raise ValueError("_sock_writer is None, try calling bind()"
-                             " on the server.")
+            if self._sock_writer is None or self._sock_reader is None:
+                raise ValueError("_sock_writer is None, try calling bind()"
+                                 " on the server.")
 
-        self._sock_writer.write(mbap_hdr + modbus_pdu)
+            try:
+                response = await asyncio.wait_for(
+                    self._exchange(mbap_hdr + modbus_pdu), self.timeout)
+            except asyncio.TimeoutError:
+                # drop the connection: a late response would otherwise be
+                # read as the answer to the next request
+                await self._close()
+                raise OSError(errno.ETIMEDOUT, 'modbus response timeout')
 
+            modbus_data = self._validate_resp_hdr(response=response,
+                                                  trans_id=trans_id,
+                                                  slave_addr=slave_addr,
+                                                  function_code=modbus_pdu[0],
+                                                  count=count)
+
+            return modbus_data
+
+    async def _exchange(self, adu: bytes) -> bytes:
+        """Send a Modbus ADU and return the raw response."""
+
+        self._sock_writer.write(adu)
         await self._sock_writer.drain()
+        return await self._sock_reader.read(256)
 
-        response = await self._sock_reader.read(256)
+    async def _close(self) -> None:
+        """Close the connection (if any), ignoring errors."""
 
-        modbus_data = self._validate_resp_hdr(response=response,
-                                              trans_id=trans_id,
-                                              slave_addr=slave_addr,
-                                              function_code=modbus_pdu[0],
-                                              count=count)
-
-        return modbus_data
+        writer = self._sock_writer
+        self._sock_reader, self._sock_writer = None, None
+        self.is_connected = False
+        if writer is None:
+            return
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
     async def connect(self) -> None:
         """@see TCP.connect"""
 
-        if self._sock_writer is not None:
-            # clean up old writer
-            self._sock_writer.close()
-            await self._sock_writer.wait_closed()
-
-        self.is_connected = False
-        self._sock_reader, self._sock_writer = \
-            await asyncio.open_connection(self._slave_ip, self._slave_port)
-        self.is_connected = True
+        async with self._lock:
+            # clean up old connection
+            await self._close()
+            try:
+                self._sock_reader, self._sock_writer = await asyncio.wait_for(
+                    asyncio.open_connection(self._slave_ip, self._slave_port),
+                    self.timeout)
+            except asyncio.TimeoutError:
+                raise OSError(errno.ETIMEDOUT, 'modbus connect timeout')
+            self.is_connected = True
 
 
 class AsyncTCPServer(TCPServer):
