@@ -101,7 +101,10 @@ class CommonTCPFunctions(object):
         # trans_id = random.getrandbits(24) & 0xFFFF
         # use incrementing counter as it's faster
         trans_id = self.trans_id_ctr
-        self.trans_id_ctr += 1
+        # the MBAP transaction ID is 16 bit; wrap around instead of growing
+        # unbounded (MicroPython's struct.pack silently truncates to 16 bit,
+        # which would make every response fail _validate_resp_hdr)
+        self.trans_id_ctr = (self.trans_id_ctr + 1) & 0xFFFF
 
         mbap_hdr = struct.pack(
             '>HHHB', trans_id, 0, len(modbus_pdu) + 1, slave_addr)
